@@ -14,6 +14,11 @@ Constelyric shows the lyrics of whatever is playing (Spotify, Apple Music, YouTu
 - **Focus** - one line at a time; upcoming words float up into place.
 - **Constellation** - fullscreen: every word becomes a star, linked into a growing constellation, inside a soft ambient glow that drifts around the screen edge.
 
+## Website
+
+The download page lives in `docs/index.html`. Edit the `REPO` line near the bottom to your `username/repo`, then enable
+**Settings -> Pages -> Deploy from a branch -> `main` / `/docs`** on GitHub. The Download button then always links to your latest release.
+
 ## Install
 
 1. Open the [**Releases**](../../releases/latest) page.
