@@ -1,0 +1,57 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']          # e.g. git tag v1.0.0 && git push --tags
+  workflow_dispatch:       # or run it by hand from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Work out version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0"; fi
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build app (PyInstaller)
+        run: pyinstaller --noconfirm --noconsole --name Constelyric --icon assets/icon.ico --collect-all winsdk constelyric.py
+
+      - name: Build installer (Inno Setup)
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=${{ steps.ver.outputs.v }}" installer\Constelyric.iss
+
+      - name: Portable zip
+        run: Compress-Archive -Path dist\Constelyric\* -DestinationPath "dist\Constelyric-portable-${{ steps.ver.outputs.v }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Constelyric-windows
+          path: |
+            dist/Constelyric-Setup-*.exe
+            dist/Constelyric-portable-*.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/Constelyric-Setup-*.exe
+            dist/Constelyric-portable-*.zip
