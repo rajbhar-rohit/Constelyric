@@ -20,9 +20,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, QVariantAnimation, pyqtSignal
+from PyQt6.QtCore import (QEasingCurve, QEvent, QObject, QPoint, QPointF, QPropertyAnimation, QRectF, Qt,
+                          QTimer, QUrl, QVariantAnimation, pyqtSignal)
 from PyQt6.QtGui import (QAction, QBrush, QColor, QConicalGradient, QFont, QFontMetrics,
-                         QGuiApplication, QIcon, QImage, QLinearGradient, QPainter,
+                         QDesktopServices, QGuiApplication, QIcon, QImage, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap, QRadialGradient)
 from PyQt6.QtWidgets import (QApplication, QColorDialog, QFrame, QGraphicsDropShadowEffect,
                              QHBoxLayout, QLabel, QMenu, QPushButton, QSystemTrayIcon,
@@ -34,6 +35,10 @@ from winsdk.windows.media.control import (
 )
 from winsdk.windows.storage.streams import DataReader
 
+from emoji_map import emoji_for
+
+APP_VERSION = "1.0.0"                      # stamped automatically from the git tag in CI
+GITHUB_REPO = "YOUR-USERNAME/constelyric"   # stamped automatically in CI; edit if building by hand
 UA = {"User-Agent": "Constelyric/1.0 (open-source lyrics app)"}
 ES_CONTINUOUS, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000002
 FONT_FAMILIES = ["Segoe UI Variable Text", "Segoe UI", "Nirmala UI", "Arial"]
@@ -47,7 +52,7 @@ class Settings(dict):
     PATH = _ROOT / "Constelyric" / "settings.json"
     _OLD = _ROOT / "LyricFlow" / "settings.json"          # pre-rename builds
     DEFAULTS = {"style": "Stack", "show": True, "auto": True, "awake": True, "glow": True,
-                "lyric": "#FFFFFF", "highlight": "#FFFFFF", "secondary": "#A0A0AA"}
+                "skip_version": "", "lyric": "#FFFFFF", "highlight": "#FFFFFF", "secondary": "#A0A0AA"}
 
     def __init__(self):
         super().__init__(self.DEFAULTS)
@@ -261,6 +266,8 @@ class Node:
     t1: float           # media time when the word ends
     links: list = field(default_factory=list)
     ended: float = None
+    emoji: str = ""
+    anim: str = ""
 
 
 def star_path(r):
@@ -519,8 +526,13 @@ class Overlay(QWidget):
             links.append(rng.choice(near).id)
         shape = "dot" if emph < 0.15 and rng.random() < 0.18 else "star"
         side = rng.choice(["below", "left", "right", "above"])
-        self.nodes.append(Node(self._next_id, best[0], best[1], text, shape, side,
-                               self._clock, emph, t1, links))
+        hit = emoji_for(text)
+        if hit and side == "above":                      # keep the space above the star for the emoji
+            side = rng.choice(["below", "left", "right"])
+        node = Node(self._next_id, best[0], best[1], text, shape, side, self._clock, emph, t1, links)
+        if hit:
+            node.emoji, node.anim = hit
+        self.nodes.append(node)
         self._next_id += 1
         self._pulse = 1.0
 
@@ -627,6 +639,65 @@ class Overlay(QWidget):
                 p.restore()
             else:
                 p.drawText(int(tx), int(ty), nd.text)
+            if nd.emoji:
+                self.draw_emoji(p, nd, r, font_px, al, age, t, hi)
+
+    EMOJI_FONT = ["Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"]
+
+    def draw_emoji(self, p, nd, r, font_px, al, age, t, hi):
+        """The word's emoji pops out above its star with a burst of sparkles, then keeps a
+        small looping animation that suits it (eyes blink, hearts beat, fire flickers...)."""
+        em = max(22.0, font_px * 1.5)
+        cx, cy = nd.x, nd.y - r - em * 0.62 - 8
+        x = clamp01(age / 0.5)
+        pop = 1 + 2.70158 * (x - 1) ** 3 + 1.70158 * (x - 1) ** 2      # overshoot, then settle
+        dx = dy = rot = 0.0
+        sx = sy = 1.0
+        fa = 1.0
+        ph = t + nd.id * 0.7                                            # neighbours don't move in sync
+        st = nd.anim
+        if st == "wobble":
+            dx = 5 * math.sin(ph * 4)
+            sy = 1 - 0.9 * max(0.0, math.sin(ph * 2.1)) ** 30           # blink
+        elif st == "pulse":
+            sx = sy = 1 + 0.22 * abs(math.sin(ph * 4.5)) ** 3           # heartbeat
+        elif st == "flicker":
+            sx = sy = 1 + 0.09 * math.sin(ph * 17) + 0.05 * math.sin(ph * 11)
+            rot = 6 * math.sin(ph * 13)
+        elif st == "spin":
+            rot = ph * 45
+        elif st == "twinkle":
+            sx = sy = 1 + 0.15 * math.sin(ph * 4)
+            fa = 0.78 + 0.22 * math.sin(ph * 6)
+        elif st == "drop":
+            q = (ph * 1.6) % 1.0
+            dy, fa = q * 14 - 4, 1 - 0.8 * q ** 3
+        elif st == "bounce":
+            dy = -abs(math.sin(ph * 5)) * em * 0.2
+        else:                                                           # float
+            dy, rot = math.sin(ph * 1.6) * em * 0.12, 5 * math.sin(ph * 1.1)
+        font = QFont()
+        font.setFamilies(self.EMOJI_FONT)
+        font.setPixelSize(int(em))
+        p.save()
+        p.translate(cx + dx, cy + dy)
+        p.rotate(rot)
+        p.scale(sx * pop, sy * pop)
+        p.setOpacity(clamp01(al * fa))
+        p.setFont(font)
+        p.drawText(QRectF(-em, -em, 2 * em, 2 * em), Qt.AlignmentFlag.AlignCenter, nd.emoji)
+        p.restore()
+        if age < 0.8:                                                   # sparkle burst
+            q = age / 0.8
+            e = 1 - (1 - q) ** 3
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(alpha(hi, 230 * (1 - q) * al))
+            for j in range(7):
+                ang, d = j * 2 * math.pi / 7 + nd.id, em * (0.55 + 0.9 * e)
+                p.save()
+                p.translate(cx + math.cos(ang) * d, cy + math.sin(ang) * d)
+                p.drawPath(star_path(3.5 + 2 * (1 - q)))
+                p.restore()
 
     # ---- Stack / Focus styles -------------------------------------------------
     def draw_line(self, p, line, y, now, scale, amul, state, k=1.0, rise=False):
@@ -959,11 +1030,13 @@ class Panel(QWidget):
     QPushButton#quit { color: #F2F2F7; background: rgba(255,255,255,15); border: none;
                        border-radius: 8px; padding: 8px; font-size: 13px; }
     QPushButton#quit:hover { background: rgba(255,69,58,200); }
+    QPushButton#link { color: #FFD666; background: transparent; border: none; font-size: 12px; padding: 2px; }
+    QPushButton#link:hover { text-decoration: underline; }
     """
 
-    def __init__(self, overlay, app):
+    def __init__(self, overlay, app, updater=None):
         super().__init__()
-        self.overlay, self.app = overlay, app
+        self.overlay, self.app, self.updater = overlay, app, updater
         self._dialog, self._hidden_at, self._art_key = False, 0.0, None
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.WindowStaysOnTopHint)
@@ -1031,6 +1104,14 @@ class Panel(QWidget):
                                  ("Highlight", self.wells["highlight"]),
                                  ("Secondary text", self.wells["secondary"])]))
 
+        ver = QHBoxLayout()
+        self.up_label = QLabel(f"Version {APP_VERSION}"); self.up_label.setObjectName("sub")
+        self.up_btn = QPushButton("Check for updates"); self.up_btn.setObjectName("link")
+        self.up_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.up_btn.clicked.connect(self._check)
+        ver.addWidget(self.up_label); ver.addStretch(1); ver.addWidget(self.up_btn)
+        v.addLayout(ver)
+
         hint = QLabel("Windows can't draw over the lock screen, so lyrics show on your desktop.\n"
                       "Constellation is fullscreen: press Esc to exit.")
         hint.setObjectName("sub"); hint.setWordWrap(True)
@@ -1086,6 +1167,14 @@ class Panel(QWidget):
             self.wells[key].set_color(c)
         self.activateWindow()
 
+    def _check(self):
+        if self.updater:
+            self.set_update_status("Checking…")
+            self.updater.check(True)
+
+    def set_update_status(self, text):
+        self.up_label.setText(text)
+
     def sync_style(self):
         self.seg.set(S["style"])
 
@@ -1140,6 +1229,117 @@ class Panel(QWidget):
 
 
 # --------------------------------------------------------------------------
+# Update checker (GitHub Releases) + pop-up
+# --------------------------------------------------------------------------
+def parse_ver(s):
+    nums = [int(x) for x in re.findall(r"\d+", str(s))[:3]]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+class Updater(QObject):
+    result = pyqtSignal(dict)       # state: new | latest | error
+
+    def check(self, manual=False):
+        threading.Thread(target=self._run, args=(manual,), daemon=True).start()
+
+    def _run(self, manual):
+        out = {"state": "error", "manual": manual}
+        try:
+            if GITHUB_REPO.startswith("YOUR-"):
+                raise RuntimeError("update source not configured")
+            r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", headers=UA, timeout=8)
+            if r.status_code == 404:                      # no release published yet
+                out["state"] = "latest"
+            else:
+                d = r.json()
+                tag = str(d.get("tag_name", ""))
+                setup = next((a["browser_download_url"] for a in d.get("assets", [])
+                              if re.search(r"setup.*\.exe$", a.get("name", ""), re.I)), d.get("html_url"))
+                out.update(state="new" if parse_ver(tag) > parse_ver(APP_VERSION) else "latest",
+                           version=tag.lstrip("vV"), notes=d.get("body") or "", url=setup)
+        except Exception as e:
+            print("[update] check failed:", e)
+        self.result.emit(out)
+
+
+class UpdatePopup(QWidget):
+    CSS = """
+    QPushButton#ghost { color: #F2F2F7; background: rgba(255,255,255,15); border: none; border-radius: 8px;
+                        padding: 8px 12px; font-size: 13px; }
+    QPushButton#ghost:hover { background: rgba(255,255,255,32); }
+    QPushButton#primary { color: #241A05; background: #FFD666; border: none; border-radius: 8px;
+                          padding: 8px 18px; font-size: 13px; font-weight: 600; }
+    QPushButton#primary:hover { background: #FFE08A; }
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.info, self.on_skip, self._anims = {}, None, ()
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)    # never steal focus
+        self.setFixedWidth(392)
+        self.setStyleSheet(Panel.STYLE_CSS + self.CSS)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 14, 18, 22)
+        card = QFrame(); card.setObjectName("card")
+        sh = QGraphicsDropShadowEffect(self)
+        sh.setBlurRadius(34); sh.setOffset(0, 8); sh.setColor(QColor(0, 0, 0, 160))
+        card.setGraphicsEffect(sh)
+        outer.addWidget(card)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(8)
+        head = QHBoxLayout(); head.setSpacing(8)
+        mark = QLabel(); mark.setFixedSize(22, 22)
+        mark.setPixmap(logo_pixmap(22, 6))
+        title = QLabel("Update available"); title.setObjectName("title")
+        head.addWidget(mark); head.addWidget(title); head.addStretch(1)
+        v.addLayout(head)
+        self.msg = QLabel(); self.msg.setWordWrap(True)
+        self.notes = QLabel(); self.notes.setObjectName("sub"); self.notes.setWordWrap(True)
+        v.addWidget(self.msg); v.addWidget(self.notes)
+        row = QHBoxLayout(); row.setSpacing(8)
+        later, skip, dl = QPushButton("Later"), QPushButton("Skip version"), QPushButton("Download")
+        later.setObjectName("ghost"); skip.setObjectName("ghost"); dl.setObjectName("primary")
+        for b in (later, skip, dl):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        later.clicked.connect(self.hide)
+        skip.clicked.connect(self._skip)
+        dl.clicked.connect(self._download)
+        row.addWidget(later); row.addWidget(skip); row.addStretch(1); row.addWidget(dl)
+        v.addSpacing(4); v.addLayout(row)
+
+    def _skip(self):
+        if self.on_skip:
+            self.on_skip(self.info.get("version", ""))
+        self.hide()
+
+    def _download(self):
+        QDesktopServices.openUrl(QUrl(self.info.get("url") or f"https://github.com/{GITHUB_REPO}/releases/latest"))
+        self.hide()
+
+    def show_for(self, info, on_skip):
+        self.info, self.on_skip = info, on_skip
+        self.msg.setText(f"Constelyric {info['version']} is out. You have {APP_VERSION}.")
+        lines = [re.sub(r"^[#>*\-\s]+", "", l).strip() for l in info.get("notes", "").splitlines()]
+        lines = [l for l in lines if l][:3]
+        self.notes.setText("\n".join("•  " + l[:72] for l in lines))
+        self.notes.setVisible(bool(lines))
+        self.adjustSize()
+        geo = QGuiApplication.primaryScreen().availableGeometry()
+        end = QPoint(geo.right() - self.width() + 1, geo.bottom() - self.height() + 1)
+        self.move(end.x(), end.y() + 28)
+        self.setWindowOpacity(0.0)
+        self.show()
+        a1 = QPropertyAnimation(self, b"windowOpacity", self); a1.setDuration(350); a1.setEndValue(1.0)
+        a2 = QPropertyAnimation(self, b"pos", self); a2.setDuration(500); a2.setEndValue(end)
+        a2.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anims = (a1, a2)
+        a1.start(); a2.start()
+
+
+# --------------------------------------------------------------------------
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -1153,7 +1353,22 @@ def main():
     apply_awake()
 
     overlay = Overlay()
-    panel = Panel(overlay, app)
+    updater = Updater()
+    popup = UpdatePopup()
+    panel = Panel(overlay, app, updater)
+
+    def on_update(info):
+        if info["state"] == "new":
+            panel.set_update_status(f"Update available: v{info['version']}")
+            if info["manual"] or S["skip_version"] != info["version"]:
+                popup.show_for(info, lambda ver: (S.__setitem__("skip_version", ver), S.save()))
+        elif info["manual"]:
+            panel.set_update_status("You’re up to date ✓" if info["state"] == "latest"
+                                    else "Couldn’t check for updates")
+
+    updater.result.connect(on_update)
+    QTimer.singleShot(10000, lambda: updater.check(False))        # shortly after launch...
+    recheck = QTimer(); recheck.timeout.connect(lambda: updater.check(False)); recheck.start(6 * 3600 * 1000)
     overlay.on_escape = panel.sync_style
     start_media_thread()
 
@@ -1162,7 +1377,8 @@ def main():
     menu = QMenu()
     a_open = QAction("Open Constelyric"); a_open.triggered.connect(panel.toggle)
     a_quit = QAction("Quit"); a_quit.triggered.connect(app.quit)
-    menu.addAction(a_open); menu.addAction(a_quit)
+    a_upd = QAction("Check for updates"); a_upd.triggered.connect(lambda: (panel.set_update_status("Checking…"), updater.check(True)))
+    menu.addAction(a_open); menu.addAction(a_upd); menu.addAction(a_quit)
     tray.setContextMenu(menu)
     tray.activated.connect(lambda r: panel.toggle() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
     tray.show()

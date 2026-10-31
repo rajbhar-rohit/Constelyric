@@ -34,8 +34,29 @@ To uninstall: Windows Settings -> Apps -> Constelyric (or delete the portable fo
 
 - **Tray icon:** click to open the panel, right-click to quit.
 - **Display:** Stack, Focus or Constellation (fullscreen - press **Esc** to leave).
-- **Options:** show/hide lyrics, colours from the album art, keep the display awake, border glow.
+- **Options:** show/hide lyrics, colours from the album art, keep the display awake, border glow, check for updates.
 - Windows doesn't let apps draw over the lock screen, so lyrics appear on the desktop.
+
+## Emoji in the constellation
+
+Words with a known meaning get an animated emoji above their star: *aankhein* / *ojos* / *yeux* / आँखें blink as 👀,
+*dil* / *corazón* / *Herz* beat as ❤️, *aag* / *fuego* / *feu* flicker as 🔥, *chand* / *luna* / *Mond* float as 🌙, rain drips, tears fall,
+stars twinkle... Around 30 ideas and 880 words across English, Hindi/Urdu/Punjabi (romanised and Devanagari),
+Spanish, French, Portuguese, German, Italian, Turkish, Russian, Arabic, Korean, Japanese and Chinese.
+
+**Add your own words** - either edit `emoji_map.py` (and send a pull request!) or create
+`%APPDATA%\Constelyric\emoji.json`:
+
+```json
+{ "tumhare": "🫶", "samundar": "🌊", "yaadein": "💭" }
+```
+
+## Updates
+
+Constelyric checks GitHub Releases shortly after launch and every 6 hours. When a newer version exists a pop-up offers
+**Download**, **Later** or **Skip version**. You can also click **Check for updates** in the panel or tray menu.
+Release builds stamp their own version and repo automatically (`tools/set_version.py`); if you build by hand, set
+`GITHUB_REPO` near the top of `constelyric.py`.
 
 ## Troubleshooting
 
