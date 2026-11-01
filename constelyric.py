@@ -1164,8 +1164,19 @@ class Panel(QWidget):
 # Update checker (GitHub Releases) + pop-up
 # --------------------------------------------------------------------------
 def parse_ver(s):
-    nums = [int(x) for x in re.findall(r"\d+", str(s))[:3]]
+    nums = [int(x) for x in re.findall(r"\d+", str(s).split("-")[0])[:3]]
     return tuple(nums + [0] * (3 - len(nums)))
+
+
+def is_newer(tag, current):
+    """True if release `tag` is newer than the running version.  Handles labelled releases such as
+    1.0.0-bug-fixes, which count as newer than a plain 1.0.0."""
+    t, c = parse_ver(tag), parse_ver(current)
+    if t != c:
+        return t > c
+    t_sfx = str(tag).lstrip("vV").partition("-")[2]
+    c_sfx = str(current).lstrip("vV").partition("-")[2]
+    return bool(t_sfx) and t_sfx != c_sfx
 
 
 class Updater(QObject):
@@ -1187,7 +1198,7 @@ class Updater(QObject):
                 tag = str(d.get("tag_name", ""))
                 setup = next((a["browser_download_url"] for a in d.get("assets", [])
                               if re.search(r"setup.*\.exe$", a.get("name", ""), re.I)), d.get("html_url"))
-                out.update(state="new" if parse_ver(tag) > parse_ver(APP_VERSION) else "latest",
+                out.update(state="new" if is_newer(tag, APP_VERSION) else "latest",
                            version=tag.lstrip("vV"), notes=d.get("body") or "", url=setup)
         except Exception as e:
             print("[update] check failed:", e)
