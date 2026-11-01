@@ -35,8 +35,6 @@ from winsdk.windows.media.control import (
 )
 from winsdk.windows.storage.streams import DataReader
 
-from emoji_map import emoji_for
-
 APP_VERSION = "1.0.0"                      # stamped automatically from the git tag in CI
 GITHUB_REPO = "YOUR-USERNAME/constelyric"   # stamped automatically in CI; edit if building by hand
 UA = {"User-Agent": "Constelyric/1.0 (open-source lyrics app)"}
@@ -266,8 +264,6 @@ class Node:
     t1: float           # media time when the word ends
     links: list = field(default_factory=list)
     ended: float = None
-    emoji: str = ""
-    anim: str = ""
 
 
 def star_path(r):
@@ -526,13 +522,8 @@ class Overlay(QWidget):
             links.append(rng.choice(near).id)
         shape = "dot" if emph < 0.15 and rng.random() < 0.18 else "star"
         side = rng.choice(["below", "left", "right", "above"])
-        hit = emoji_for(text)
-        if hit and side == "above":                      # keep the space above the star for the emoji
-            side = rng.choice(["below", "left", "right"])
-        node = Node(self._next_id, best[0], best[1], text, shape, side, self._clock, emph, t1, links)
-        if hit:
-            node.emoji, node.anim = hit
-        self.nodes.append(node)
+        self.nodes.append(Node(self._next_id, best[0], best[1], text, shape, side,
+                               self._clock, emph, t1, links))
         self._next_id += 1
         self._pulse = 1.0
 
@@ -639,65 +630,6 @@ class Overlay(QWidget):
                 p.restore()
             else:
                 p.drawText(int(tx), int(ty), nd.text)
-            if nd.emoji:
-                self.draw_emoji(p, nd, r, font_px, al, age, t, hi)
-
-    EMOJI_FONT = ["Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"]
-
-    def draw_emoji(self, p, nd, r, font_px, al, age, t, hi):
-        """The word's emoji pops out above its star with a burst of sparkles, then keeps a
-        small looping animation that suits it (eyes blink, hearts beat, fire flickers...)."""
-        em = max(22.0, font_px * 1.5)
-        cx, cy = nd.x, nd.y - r - em * 0.62 - 8
-        x = clamp01(age / 0.5)
-        pop = 1 + 2.70158 * (x - 1) ** 3 + 1.70158 * (x - 1) ** 2      # overshoot, then settle
-        dx = dy = rot = 0.0
-        sx = sy = 1.0
-        fa = 1.0
-        ph = t + nd.id * 0.7                                            # neighbours don't move in sync
-        st = nd.anim
-        if st == "wobble":
-            dx = 5 * math.sin(ph * 4)
-            sy = 1 - 0.9 * max(0.0, math.sin(ph * 2.1)) ** 30           # blink
-        elif st == "pulse":
-            sx = sy = 1 + 0.22 * abs(math.sin(ph * 4.5)) ** 3           # heartbeat
-        elif st == "flicker":
-            sx = sy = 1 + 0.09 * math.sin(ph * 17) + 0.05 * math.sin(ph * 11)
-            rot = 6 * math.sin(ph * 13)
-        elif st == "spin":
-            rot = ph * 45
-        elif st == "twinkle":
-            sx = sy = 1 + 0.15 * math.sin(ph * 4)
-            fa = 0.78 + 0.22 * math.sin(ph * 6)
-        elif st == "drop":
-            q = (ph * 1.6) % 1.0
-            dy, fa = q * 14 - 4, 1 - 0.8 * q ** 3
-        elif st == "bounce":
-            dy = -abs(math.sin(ph * 5)) * em * 0.2
-        else:                                                           # float
-            dy, rot = math.sin(ph * 1.6) * em * 0.12, 5 * math.sin(ph * 1.1)
-        font = QFont()
-        font.setFamilies(self.EMOJI_FONT)
-        font.setPixelSize(int(em))
-        p.save()
-        p.translate(cx + dx, cy + dy)
-        p.rotate(rot)
-        p.scale(sx * pop, sy * pop)
-        p.setOpacity(clamp01(al * fa))
-        p.setFont(font)
-        p.drawText(QRectF(-em, -em, 2 * em, 2 * em), Qt.AlignmentFlag.AlignCenter, nd.emoji)
-        p.restore()
-        if age < 0.8:                                                   # sparkle burst
-            q = age / 0.8
-            e = 1 - (1 - q) ** 3
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(alpha(hi, 230 * (1 - q) * al))
-            for j in range(7):
-                ang, d = j * 2 * math.pi / 7 + nd.id, em * (0.55 + 0.9 * e)
-                p.save()
-                p.translate(cx + math.cos(ang) * d, cy + math.sin(ang) * d)
-                p.drawPath(star_path(3.5 + 2 * (1 - q)))
-                p.restore()
 
     # ---- Stack / Focus styles -------------------------------------------------
     def draw_line(self, p, line, y, now, scale, amul, state, k=1.0, rise=False):
