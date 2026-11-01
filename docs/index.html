@@ -82,6 +82,18 @@ footer{padding-top:50px;padding-bottom:40px;text-align:center;color:var(--muted)
 footer a{color:var(--accent);text-decoration:none}
 .rv{opacity:0;transform:translateY(26px);transition:opacity .8s cubic-bezier(.2,.7,.2,1),transform .8s cubic-bezier(.2,.7,.2,1)}
 .rv.in{opacity:1;transform:none}
+.pop{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:22px;background:rgba(8,6,16,.45);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);opacity:0;visibility:hidden;transition:opacity .45s,visibility .45s}
+.pop.show{opacity:1;visibility:visible}
+.popcard{width:min(400px,100%);padding:34px 28px 26px;text-align:center;transform:translateY(30px) scale(.94);transition:transform .55s cubic-bezier(.2,.9,.3,1.3)}
+.pop.show .popcard{transform:none}
+.popcard h3{margin:10px 0 6px;font-size:23px}
+.popcard p{margin:0 0 14px;color:var(--muted);font-size:15px}
+.popcard .cnt{font-size:13px;color:var(--accent);min-height:1em;margin-bottom:16px}
+.bigstar{font-size:54px;line-height:1;color:var(--accent);filter:drop-shadow(0 0 18px rgba(255,200,90,.8));animation:spin 4s ease-in-out infinite}
+@keyframes spin{0%,100%{transform:rotate(-8deg) scale(1)}50%{transform:rotate(12deg) scale(1.15)}}
+.x{position:absolute;top:10px;right:14px;border:0;background:none;color:var(--muted);font-size:26px;line-height:1;cursor:pointer}
+.x:hover,.later:hover{color:var(--text)}
+.later{display:block;margin:14px auto 0;border:0;background:none;color:var(--muted);font:inherit;font-size:14px;cursor:pointer}
 @media (max-width:860px){.hero{grid-template-columns:1fr;padding-top:30px}.grid,.steps{grid-template-columns:1fr}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}.rv{opacity:1;transform:none}}
 </style>
@@ -136,9 +148,21 @@ footer a{color:var(--accent);text-decoration:none}
   <p><a data-repo href="#">Source on GitHub</a> · <a data-rel href="#">All releases</a></p>
 </footer>
 
+<div class="pop" id="star" role="dialog" aria-modal="true" aria-labelledby="st">
+  <div class="glass popcard">
+    <button class="x" data-close aria-label="Close">×</button>
+    <div class="bigstar">★</div>
+    <h3 id="st">Enjoying Constelyric?</h3>
+    <p>It’s free and open source. A star on GitHub helps other people find it.</p>
+    <p class="cnt" id="cnt"></p>
+    <a class="btn" data-star target="_blank" rel="noopener" href="#">★ Star on GitHub</a>
+    <button class="later" data-close>Maybe later</button>
+  </div>
+</div>
+
 <script>
 // ✎ Set this to your GitHub "username/repo" before publishing the site.
-const REPO = "rajbhar-rohit/constelyric";
+const REPO = "rajbhar-rohit/Constelyric";
 
 const base = "https://github.com/" + REPO;
 document.querySelectorAll("[data-repo]").forEach(a => a.href = base);
@@ -217,6 +241,19 @@ document.querySelectorAll(".glass").forEach(g => g.addEventListener("pointermove
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
+})();
+
+// “Star us” pop-up: opens on every visit (nothing is stored in the browser)
+(() => {
+  const pop = document.getElementById("star"), close = () => pop.classList.remove("show");
+  document.querySelectorAll("[data-star]").forEach(a => a.href = base);
+  if (!REPO.startsWith("YOUR-")) fetch("https://api.github.com/repos/" + REPO).then(r => r.json()).then(d => {
+    if (d.stargazers_count != null) document.getElementById("cnt").textContent = d.stargazers_count.toLocaleString() + " people have starred it";
+  }).catch(() => {});
+  setTimeout(() => { pop.classList.add("show"); pop.querySelector("a").focus({preventScroll: true}); }, 1800);
+  pop.addEventListener("click", e => { if (e.target === pop || e.target.closest("[data-close]")) close(); });
+  addEventListener("keydown", e => { if (e.key === "Escape") close(); });
+  pop.querySelector("a").addEventListener("click", () => setTimeout(close, 300));
 })();
 </script>
 </body>

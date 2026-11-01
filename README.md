@@ -14,6 +14,11 @@ Constelyric shows the lyrics of whatever is playing (Spotify, Apple Music, YouTu
 - **Focus** - one line at a time; upcoming words float up into place.
 - **Constellation** - fullscreen: every word becomes a star, linked into a growing constellation, inside a soft ambient glow that drifts around the screen edge.
 
+## Website
+
+The download page lives in `docs/index.html`. Edit the `REPO` line near the bottom to your `username/repo`, then enable
+**Settings -> Pages -> Deploy from a branch -> `main` / `/docs`** on GitHub. The Download button then always links to your latest release.
+
 ## Install
 
 1. Open the [**Releases**](../../releases/latest) page.
@@ -29,8 +34,15 @@ To uninstall: Windows Settings -> Apps -> Constelyric (or delete the portable fo
 
 - **Tray icon:** click to open the panel, right-click to quit.
 - **Display:** Stack, Focus or Constellation (fullscreen - press **Esc** to leave).
-- **Options:** show/hide lyrics, colours from the album art, keep the display awake, border glow.
+- **Options:** show/hide lyrics, colours from the album art, keep the display awake, border glow, check for updates.
 - Windows doesn't let apps draw over the lock screen, so lyrics appear on the desktop.
+
+## Updates
+
+Constelyric checks GitHub Releases shortly after launch and every 6 hours. When a newer version exists a pop-up offers
+**Download**, **Later** or **Skip version**. You can also click **Check for updates** in the panel or tray menu.
+Release builds stamp their own version and repo automatically (`tools/set_version.py`); if you build by hand, set
+`GITHUB_REPO` near the top of `constelyric.py`.
 
 ## Troubleshooting
 

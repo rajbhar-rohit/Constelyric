@@ -21,6 +21,9 @@ UninstallDisplayIcon={app}\Constelyric.exe
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; lets an update replace the running tray app
+CloseApplications=force
+RestartApplications=no
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Tasks]

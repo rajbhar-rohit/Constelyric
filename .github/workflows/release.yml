@@ -29,6 +29,9 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0"; fi
           echo "v=$v" >> "$GITHUB_OUTPUT"
 
+      - name: Stamp version and repo into the app
+        run: python tools/set_version.py ${{ steps.ver.outputs.v }}
+
       - name: Build app (PyInstaller)
         run: pyinstaller --noconfirm --noconsole --name Constelyric --icon assets/icon.ico --collect-all winsdk constelyric.py
 
