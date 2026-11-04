@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **More lyrics sources:** lrc.red, BiniLyrics, LyricsPlus, KuGou (word-by-word KRC), BetterLyrics and Musixmatch
+  (your own API key) join LRCLIB. A new *Lyrics sources* window lets you switch them on/off and reorder them; the
+  panel shows which service was used. Word-by-word results are preferred over line-by-line ones.
+- **Smoother constellation:** words come into focus (blur-in) as they appear, the old sky melts away instead of
+  disappearing, stars drift gently, and the current word gets a soft out-of-focus halo.
+- Tests for the lyrics sources (`python -m unittest tests.test_sources`).
+
 ## v1.0.0-bug-fixes
 
 - **Updates:** Constelyric now checks GitHub Releases at launch and every 6 hours and shows a pop-up

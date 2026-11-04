@@ -6,6 +6,7 @@ Windows media controls (Spotify, Apple Music, browsers, VLC, ...).
 Lyrics: LRCLIB (line-synced); word timings are estimated within each line.
 """
 import asyncio
+import copy
 import ctypes
 import json
 import math
@@ -26,7 +27,7 @@ from PyQt6.QtGui import (QAction, QBrush, QColor, QConicalGradient, QFont, QFont
                          QDesktopServices, QGuiApplication, QIcon, QImage, QLinearGradient, QPainter,
                          QPainterPath, QPen, QPixmap, QRadialGradient)
 from PyQt6.QtWidgets import (QApplication, QColorDialog, QFrame, QGraphicsDropShadowEffect,
-                             QHBoxLayout, QLabel, QMenu, QPushButton, QSystemTrayIcon,
+                             QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QSystemTrayIcon,
                              QVBoxLayout, QWidget)
 
 from winsdk.windows.media.control import (
@@ -34,6 +35,9 @@ from winsdk.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlayStatus,
 )
 from winsdk.windows.storage.streams import DataReader
+
+from lyrics_sources import (INFO, Line, build_lines, clean_title, default_sources, find_lyrics,
+                            first_artist, ordered_sources)
 
 APP_VERSION = "1.0.0"                      # stamped automatically from the git tag in CI
 GITHUB_REPO = "YOUR-USERNAME/constelyric"   # stamped automatically in CI; edit if building by hand
@@ -50,10 +54,10 @@ class Settings(dict):
     PATH = _ROOT / "Constelyric" / "settings.json"
     _OLD = _ROOT / "LyricFlow" / "settings.json"          # pre-rename builds
     DEFAULTS = {"style": "Stack", "show": True, "auto": True, "awake": True, "glow": True,
-                "skip_version": "", "lyric": "#FFFFFF", "highlight": "#FFFFFF", "secondary": "#A0A0AA"}
+                "skip_version": "", "sources": default_sources(), "musixmatch_key": "", "lyric": "#FFFFFF", "highlight": "#FFFFFF", "secondary": "#A0A0AA"}
 
     def __init__(self):
-        super().__init__(self.DEFAULTS)
+        super().__init__(copy.deepcopy(self.DEFAULTS))
         for path in (self.PATH, self._OLD):
             try:
                 self.update(json.loads(path.read_text(encoding="utf-8")))
@@ -75,77 +79,6 @@ S = Settings()
 
 
 # --------------------------------------------------------------------------
-# Lyrics model + lookup
-# --------------------------------------------------------------------------
-@dataclass
-class Line:
-    start: float
-    end: float
-    words: list = field(default_factory=list)       # [(text, t0, t1), ...]
-
-
-def build_lines(lrc_text: str) -> list[Line]:
-    raw = []
-    for row in lrc_text.splitlines():
-        m = re.match(r"\s*\[(\d+):(\d+(?:\.\d+)?)\](.*)", row)
-        if m:
-            raw.append((int(m.group(1)) * 60 + float(m.group(2)), m.group(3).strip()))
-    raw.sort()
-    lines = []
-    for i, (t, text) in enumerate(raw):
-        nxt = raw[i + 1][0] if i + 1 < len(raw) else t + 5
-        end = min(nxt, t + 7)
-        words = text.split()
-        weights = [len(w) + 1 for w in words]
-        total = sum(weights) or 1
-        sung, acc, wl = (end - t) * 0.92, t, []
-        for w, wt in zip(words, weights):
-            d = sung * wt / total
-            wl.append((w, acc, acc + d))
-            acc += d
-        lines.append(Line(t, nxt, wl))
-    return lines
-
-
-def clean_title(t: str) -> str:
-    t = re.sub(r"\s*[\(\[].*?[\)\]]", "", t)
-    t = re.split(r"\s+-\s+|\s+\|\s+|\s+feat\.?\s+|\s+ft\.?\s+", t, flags=re.I)[0]
-    return t.strip()
-
-
-def first_artist(a: str) -> str:
-    return re.split(r"\s*(?:,|&|;|/|\bfeat\.?\b|\bft\.?\b|\band\b)\s*", a, flags=re.I)[0].strip()
-
-
-def fetch_lyrics(artist: str, title: str, duration: float) -> list[Line]:
-    ct, fa = clean_title(title), first_artist(artist)
-    print(f"[lyrics] looking for: {artist!r} / {title!r}  ->  {fa!r} / {ct!r}")
-    try:
-        for a, t in ((artist, title), (fa, ct), (fa, title)):
-            params = {"artist_name": a, "track_name": t}
-            if duration:
-                params["duration"] = int(duration)
-            r = requests.get("https://lrclib.net/api/get", headers=UA, timeout=8, params=params)
-            if r.ok and r.json().get("syncedLyrics"):
-                print("[lyrics] found via exact match")
-                return build_lines(r.json()["syncedLyrics"])
-        for q in (f"{fa} {ct}", f"{ct} {fa}", ct, title):
-            r = requests.get("https://lrclib.net/api/search", headers=UA, timeout=8, params={"q": q})
-            hits = [h for h in (r.json() if r.ok else []) if h.get("syncedLyrics")]
-            if hits:
-                if duration:
-                    hits.sort(key=lambda h: abs((h.get("duration") or 0) - duration))
-                    if abs((hits[0].get("duration") or 0) - duration) > 8:
-                        continue
-                print(f"[lyrics] found via search: {q!r}")
-                return build_lines(hits[0]["syncedLyrics"])
-        print("[lyrics] nothing found on LRCLIB")
-    except Exception as e:
-        print("[lyrics] error:", e)
-    return []
-
-
-# --------------------------------------------------------------------------
 # Shared player state (written by a background thread)
 # --------------------------------------------------------------------------
 class State:
@@ -158,6 +91,8 @@ class State:
     art = None            # raw image bytes
     title = artist = ""
     status = "idle"       # idle | searching | found | none
+    source = ""           # which service the lyrics came from
+    word_synced = False
 
     def now(self):
         return self.pos + (time.monotonic() - self.stamp if self.playing else 0)
@@ -198,6 +133,7 @@ async def media_loop():
                     STATE.key, STATE.lines = key, []
                     STATE.title, STATE.artist = props.title, props.artist
                     STATE.status, STATE.palette, STATE.art = "searching", None, None
+                    STATE.source, STATE.word_synced = "", False
                     dur = tl.end_time.total_seconds() - tl.start_time.total_seconds()
                     try:
                         st = await props.thumbnail.open_read_async()
@@ -209,10 +145,12 @@ async def media_loop():
                         STATE.palette = dominant_color(STATE.art)
                     except Exception:
                         pass
-                    lines = await asyncio.to_thread(fetch_lyrics, props.artist, props.title, dur)
+                    res = await asyncio.to_thread(find_lyrics, props.artist, props.title, dur, S)
                     if key == STATE.key:
-                        STATE.lines = lines
-                        STATE.status = "found" if lines else "none"
+                        STATE.lines = res.lines if res else []
+                        STATE.source = res.source if res else ""
+                        STATE.word_synced = bool(res and res.word_synced)
+                        STATE.status = "found" if res else "none"
                 pos = tl.position.total_seconds()
                 playing = info.playback_status == PlayStatus.PLAYING
                 if playing:
@@ -285,6 +223,7 @@ class Overlay(QWidget):
         self._fs = None
         self.on_escape = lambda: None
         self.nodes = []
+        self.ghosts = []                # (time retired, nodes) - old skies fading out
         self._clock = 0.0               # animation clock, only runs while music plays
         self._last_t = time.monotonic()
         self._last_key = None
@@ -302,6 +241,7 @@ class Overlay(QWidget):
         self.apply_mode()
         t = QTimer(self)
         t.timeout.connect(self.update)
+        t.setTimerType(Qt.TimerType.PreciseTimer)
         t.start(16)
 
     def apply_mode(self):
@@ -465,7 +405,8 @@ class Overlay(QWidget):
 
     def update_nodes(self, lines, now):
         if STATE.key != self._song:                     # new song: fresh sky
-            self._song, self.nodes, self._last_key = STATE.key, [], None
+            self._retire_nodes()
+            self._song, self._last_key = STATE.key, None
         if not lines:
             return
         idx = -1
@@ -491,10 +432,19 @@ class Overlay(QWidget):
         if len(self.nodes) >= 16:                       # sky is full: start over
             reset = True
         if reset:
-            self.nodes = []
+            self._retire_nodes()
         self._last_key = (idx, cur)
         word, t0, t1 = lines[idx].words[cur]
         self.add_node(idx, cur, word, clamp01((t1 - t0 - 0.2) / 0.9), t1)
+
+    def _retire_nodes(self):
+        """Don't cut the old constellation: let it blur and fade out while the new one begins."""
+        if self.nodes:
+            for nd in self.nodes:
+                if nd.ended is None:
+                    nd.ended = self._clock
+            self.ghosts.append((self._clock, self.nodes))
+        self.nodes = []
 
     def add_node(self, idx, cur, text, emph, t1):
         w, h = self.width(), self.height()
@@ -531,43 +481,84 @@ class Overlay(QWidget):
     def rank_alpha(rank, current):
         return 1.0 if current else max(0.42, 0.78 - 0.1 * (rank - 1))
 
+    def draw_word(self, p, text, font, col, a, tx, ty, blur):
+        """Draw a word, optionally defocused. Blur = render small, scale down and back up smoothly."""
+        if blur < 0.7:
+            p.setFont(font)
+            p.setPen(alpha(col, 255 * a))
+            p.drawText(QPointF(tx, ty), text)
+            return
+        fm = QFontMetrics(font)
+        pad = int(blur * 2) + 4
+        wpx, hpx = fm.horizontalAdvance(text) + 2 * pad, fm.height() + 2 * pad
+        pm = QPixmap(wpx, hpx)
+        pm.fill(QColor(0, 0, 0, 0))
+        q = QPainter(pm)
+        q.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        q.setFont(font)
+        q.setPen(QColor(col.red(), col.green(), col.blue()))
+        q.drawText(pad, pad + fm.ascent(), text)
+        q.end()
+        f = 1.0 / (1.0 + blur * 0.55)
+        small = pm.scaled(max(2, int(wpx * f)), max(2, int(hpx * f)),
+                          Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        big = small.scaled(wpx, hpx, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        p.save()
+        p.setOpacity(p.opacity() * clamp01(a) * (1 - 0.3 * clamp01(blur / 10)))
+        p.drawPixmap(QPointF(tx - pad, ty - pad - fm.ascent()), big)
+        p.restore()
+
     def draw_constellation(self, p, hi, t, media_now):
-        n = len(self.nodes)
+        self.ghosts = [g for g in self.ghosts if self._clock - g[0] < 1.0]
+        for born, nodes in self.ghosts:                    # the previous sky melting away
+            self._draw_nodes(p, nodes, hi, t, media_now, clamp01((self._clock - born) / 0.9), True)
+        self._draw_nodes(p, self.nodes, hi, t, media_now, 0.0, False)
+
+    def _draw_nodes(self, p, nodes, hi, t, media_now, out, frozen):
+        n = len(nodes)
         if not n:
             return
         w, h = self.width(), self.height()
         k = max(0.8, h / 800)
         cream = self.mix(hi, QColor(255, 255, 255), 0.5)
-        for i, nd in enumerate(self.nodes):             # a word stops being "current" when it ends
-            if nd.ended is None and (i < n - 1 or media_now > nd.t1 + 0.35):
+        ease_out = 1 - (1 - out) ** 3
+        fade, lift, blur_out = 1 - ease_out, -ease_out * 22 * k, ease_out * 12
+        for i, nd in enumerate(nodes):                      # a word stops being "current" when it ends
+            if nd.ended is None and (frozen or i < n - 1 or media_now > nd.t1 + 0.35):
                 nd.ended = self._clock
-        alphas = [self.rank_alpha(n - 1 - i, nd.ended is None) for i, nd in enumerate(self.nodes)]
-        index = {nd.id: i for i, nd in enumerate(self.nodes)}
+        alphas = [self.rank_alpha(n - 1 - i, nd.ended is None) for i, nd in enumerate(nodes)]
+        pos = {nd.id: (nd.x + 2.4 * k * math.sin(t * 0.7 + nd.id * 1.3),          # gentle idle drift
+                       nd.y + 2.4 * k * math.cos(t * 0.6 + nd.id * 0.9) + lift) for nd in nodes}
+        index = {nd.id: i for i, nd in enumerate(nodes)}
 
         # connecting lines (a new line grows from the older word to the new one)
-        for i, nd in enumerate(self.nodes):
+        for i, nd in enumerate(nodes):
             for lid in nd.links:
                 j = index.get(lid)
                 if j is None:
                     continue
-                tg = self.nodes[j]
-                g = clamp01((self._clock - nd.born) / 0.4)
+                ax, ay = pos[nodes[j].id]
+                bx, by = pos[nd.id]
+                g = clamp01((self._clock - nd.born) / 0.55)
                 g = 1 - (1 - g) ** 3
-                ex, ey = tg.x + (nd.x - tg.x) * g, tg.y + (nd.y - tg.y) * g
                 la = 0.8 if nd.ended is None else 0.4 * min(alphas[i], alphas[j]) / 0.45
-                p.setPen(QPen(alpha(hi, 150 * min(la, 0.8)), 1.1))
-                p.drawLine(QPointF(tg.x, tg.y), QPointF(ex, ey))
+                p.setPen(QPen(alpha(hi, 150 * min(la, 0.8) * fade), 1.1))
+                p.drawLine(QPointF(ax, ay), QPointF(ax + (bx - ax) * g, ay + (by - ay) * g))
 
-        for i, nd in enumerate(self.nodes):
+        for i, nd in enumerate(nodes):
             is_cur = nd.ended is None
             age = self._clock - nd.born
-            al = alphas[i] * clamp01(age / 0.2)
+            enter = clamp01(age / 0.5)
+            enter = 1 - (1 - enter) ** 3                    # eases in; words also come into focus
+            al = alphas[i] * enter * fade
             if al <= 0.01:
                 continue
+            px, py = pos[nd.id]
             e = nd.emph
             settle = 0.0 if is_cur else clamp01((self._clock - nd.ended) / 0.35)
             settle = 1 - (1 - settle) ** 3
-            pop = 1 + 0.3 * max(0.0, 1 - age / 0.3) ** 2
+            pop = 1 + 0.18 * max(0.0, 1 - age / 0.5) ** 2
+            blur = 9 * (1 - enter) + blur_out
 
             # sizes: big while the word is sung (more so if it is held), small once it has passed
             font_cur, font_set = h * (0.034 + 0.050 * e), h * (0.020 + 0.022 * e)
@@ -578,15 +569,15 @@ class Overlay(QWidget):
             twinkle = 0.85 + 0.15 * math.sin(t * 3 + i * 1.7)
 
             if is_cur:
-                gr = QRadialGradient(QPointF(nd.x, nd.y), 56 * k)
+                gr = QRadialGradient(QPointF(px, py), 56 * k)
                 gr.setColorAt(0, alpha(hi, 100 * al))
                 gr.setColorAt(1, alpha(hi, 0))
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QBrush(gr))
-                p.drawEllipse(QPointF(nd.x, nd.y), 56 * k, 56 * k)
+                p.drawEllipse(QPointF(px, py), 56 * k, 56 * k)
 
             p.save()
-            p.translate(nd.x, nd.y)
+            p.translate(px, py)
             p.scale(pop, pop)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(alpha(col, 255 * al * twinkle))
@@ -609,27 +600,26 @@ class Overlay(QWidget):
             tw = fm.horizontalAdvance(nd.text)
             gap = r + 7 * k
             if nd.side == "below":
-                tx, ty = nd.x - tw / 2, nd.y + gap + fm.ascent()
+                tx, ty = px - tw / 2, py + gap + fm.ascent()
             elif nd.side == "above":
-                tx, ty = nd.x - tw / 2, nd.y - gap
+                tx, ty = px - tw / 2, py - gap
             elif nd.side == "left":
-                tx, ty = nd.x - gap - tw, nd.y + fm.ascent() * 0.35
+                tx, ty = px - gap - tw, py + fm.ascent() * 0.35
             else:
-                tx, ty = nd.x + gap, nd.y + fm.ascent() * 0.35
+                tx, ty = px + gap, py + fm.ascent() * 0.35
             tx = min(max(tx, 14), w - 14 - tw)
             ty = min(max(ty, fm.ascent() + 10), h - 14)
-            p.setFont(f)
-            p.setPen(alpha(col, 255 * al))
+            p.save()
             if is_cur and pop > 1.001:
                 cx, cy = tx + tw / 2, ty - fm.ascent() * 0.35
-                p.save()
+                sc = 1 + (pop - 1) * 0.6
                 p.translate(cx, cy)
-                p.scale(1 + (pop - 1) * 0.6, 1 + (pop - 1) * 0.6)
+                p.scale(sc, sc)
                 p.translate(-cx, -cy)
-                p.drawText(int(tx), int(ty), nd.text)
-                p.restore()
-            else:
-                p.drawText(int(tx), int(ty), nd.text)
+            if is_cur and not frozen:                       # soft out-of-focus halo behind the word
+                self.draw_word(p, nd.text, f, hi, 0.5 * al, tx, ty, 9.0)
+            self.draw_word(p, nd.text, f, col, al, tx, ty, blur)
+            p.restore()
 
     # ---- Stack / Focus styles -------------------------------------------------
     def draw_line(self, p, line, y, now, scale, amul, state, k=1.0, rise=False):
@@ -1018,13 +1008,18 @@ class Panel(QWidget):
         self.sw_show, self.sw_auto, self.sw_awake = Switch(S["show"]), Switch(S["auto"]), Switch(S["awake"])
         self.sw_glow = Switch(S["glow"])
         self.sw_glow.toggled.connect(lambda b: self._set("glow", b))
+        self.src_btn = QPushButton("Choose…"); self.src_btn.setObjectName("link")
+        self.src_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.src_btn.clicked.connect(self._open_sources)
+        self.sources = SourcesDialog()
         self.sw_show.toggled.connect(lambda b: self._set("show", b))
         self.sw_auto.toggled.connect(self._auto)
         self.sw_awake.toggled.connect(lambda b: (self._set("awake", b), apply_awake()))
         v.addWidget(self._group([("Show lyrics", self.sw_show),
                                  ("Auto Sync colours", self.sw_auto),
                                  ("Keep display awake", self.sw_awake),
-                                 ("Border glow", self.sw_glow)]))
+                                 ("Border glow", self.sw_glow),
+                                 ("Lyrics sources", self.src_btn)]))
 
         # Colours
         v.addWidget(self._section("COLOURS"))
@@ -1099,6 +1094,10 @@ class Panel(QWidget):
             self.wells[key].set_color(c)
         self.activateWindow()
 
+    def _open_sources(self):
+        self.hide()
+        self.sources.show_near()
+
     def _check(self):
         if self.updater:
             self.set_update_status("Checking…")
@@ -1118,7 +1117,8 @@ class Panel(QWidget):
         self.t_artist.setText(self._elide(STATE.artist, self.t_artist))
         txt, col = {"idle": ("Play something to begin", "#8E8E93"),
                     "searching": ("Finding lyrics…", "#FF9F0A"),
-                    "found": ("Word-synced lyrics", "#34C759"),
+                    "found": (("Word-synced" if STATE.word_synced else "Line-synced") + f" lyrics · {STATE.source}",
+                              "#34C759" if STATE.word_synced else "#FF9F0A"),
                     "none": ("No lyrics available", "#FF453A")}[STATE.status]
         self.t_status.setText(f'<span style="color:{col}">●</span>&nbsp; {txt}')
         key = (STATE.title, STATE.artist, bool(STATE.art))
@@ -1280,6 +1280,140 @@ class UpdatePopup(QWidget):
         a2.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anims = (a1, a2)
         a1.start(); a2.start()
+
+
+# --------------------------------------------------------------------------
+# Lyrics sources window: enable / disable / reorder, Musixmatch key
+# --------------------------------------------------------------------------
+class SourcesDialog(QWidget):
+    CSS = """
+    QPushButton#mini { color: #F2F2F7; background: rgba(255,255,255,15); border: none; border-radius: 6px;
+                       padding: 3px 7px; font-size: 10px; }
+    QPushButton#mini:hover { background: rgba(255,255,255,34); }
+    QPushButton#mini:disabled { color: rgba(255,255,255,60); }
+    QLineEdit { color: #F2F2F7; background: rgba(255,255,255,15); border: 1px solid rgba(255,255,255,26);
+                border-radius: 8px; padding: 7px 9px; font-size: 13px; }
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedWidth(450)
+        self.setStyleSheet(Panel.STYLE_CSS + UpdatePopup.CSS + self.CSS)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 14, 18, 22)
+        card = QFrame(); card.setObjectName("card")
+        sh = QGraphicsDropShadowEffect(self)
+        sh.setBlurRadius(34); sh.setOffset(0, 8); sh.setColor(QColor(0, 0, 0, 160))
+        card.setGraphicsEffect(sh)
+        outer.addWidget(card)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(8)
+        head = QHBoxLayout(); head.setSpacing(8)
+        mark = QLabel(); mark.setFixedSize(22, 22); mark.setPixmap(logo_pixmap(22, 6))
+        title = QLabel("Lyrics sources"); title.setObjectName("title")
+        head.addWidget(mark); head.addWidget(title); head.addStretch(1)
+        v.addLayout(head)
+        intro = QLabel("Tried from top to bottom. The first word-by-word result is used; if none has "
+                       "word timing, the first line-by-line one is.")
+        intro.setObjectName("sub"); intro.setWordWrap(True)
+        v.addWidget(intro)
+        group = QFrame(); group.setObjectName("group")
+        self.rows = QVBoxLayout(group)
+        self.rows.setContentsMargins(12, 2, 12, 2); self.rows.setSpacing(0)
+        v.addWidget(group)
+        lab = QLabel("Musixmatch API key (optional)"); lab.setObjectName("sub")
+        self.key = QLineEdit(S["musixmatch_key"])
+        self.key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key.setPlaceholderText("your own key from developer.musixmatch.com")
+        self.key.editingFinished.connect(self._save_key)
+        v.addWidget(lab); v.addWidget(self.key)
+        note = QLabel("Your song title and artist are sent to each enabled service. Most of these are "
+                      "free community services, so please keep to a few.")
+        note.setObjectName("sub"); note.setWordWrap(True)
+        v.addWidget(note)
+        row = QHBoxLayout()
+        reset, done = QPushButton("Reset order"), QPushButton("Done")
+        reset.setObjectName("ghost"); done.setObjectName("primary")
+        for b in (reset, done):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset.clicked.connect(self._reset)
+        done.clicked.connect(self.hide)
+        row.addWidget(reset); row.addStretch(1); row.addWidget(done)
+        v.addLayout(row)
+        self.rebuild()
+
+    def rebuild(self):
+        while self.rows.count():
+            w = self.rows.takeAt(0).widget()
+            if w:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        items = ordered_sources(S)
+        for i, src in enumerate(items):
+            sid, name_txt = src["id"], INFO[src["id"]]
+            row = QWidget()
+            h = QHBoxLayout(row); h.setContentsMargins(0, 7, 0, 7); h.setSpacing(8)
+            up, dn = QPushButton("▲"), QPushButton("▼")
+            for b in (up, dn):
+                b.setObjectName("mini"); b.setFixedWidth(26)
+                b.setCursor(Qt.CursorShape.PointingHandCursor)
+            up.setEnabled(i > 0); dn.setEnabled(i < len(items) - 1)
+            up.clicked.connect(lambda _=False, i=i: self._move(i, -1))
+            dn.clicked.connect(lambda _=False, i=i: self._move(i, +1))
+            col = QVBoxLayout(); col.setSpacing(0)
+            nm = QLabel(name_txt[0]); sub = QLabel(name_txt[1]); sub.setObjectName("sub")
+            col.addWidget(nm); col.addWidget(sub)
+            sw = Switch(src["on"])
+            sw.toggled.connect(lambda on, sid=sid: self._toggle(sid, on))
+            h.addWidget(up); h.addWidget(dn); h.addLayout(col, 1); h.addWidget(sw)
+            self.rows.addWidget(row)
+            if i < len(items) - 1:
+                sep = QFrame(); sep.setObjectName("sep"); sep.setFixedHeight(1)
+                self.rows.addWidget(sep)
+
+    def _store(self, items):
+        S["sources"] = items
+        S.save()
+
+    def _toggle(self, sid, on):
+        items = ordered_sources(S)
+        for it in items:
+            if it["id"] == sid:
+                it["on"] = on
+        self._store(items)
+
+    def _move(self, i, d):
+        items = ordered_sources(S)
+        items[i], items[i + d] = items[i + d], items[i]
+        self._store(items)
+        self.rebuild()
+
+    def _reset(self):
+        self._store(default_sources())
+        self.rebuild()
+
+    def _save_key(self):
+        S["musixmatch_key"] = self.key.text().strip()
+        S.save()
+
+    def show_near(self):
+        self.rebuild()
+        self.adjustSize()
+        geo = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(geo.right() - self.width() + 1, geo.bottom() - self.height() + 1)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def event(self, e):
+        if e.type() == QEvent.Type.WindowDeactivate:
+            self._save_key()
+            self.hide()
+        return super().event(e)
 
 
 # --------------------------------------------------------------------------

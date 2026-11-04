@@ -22,6 +22,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
+      - name: Run tests
+        run: python -m unittest tests.test_sources
+
       - name: Work out version
         id: ver
         shell: bash
