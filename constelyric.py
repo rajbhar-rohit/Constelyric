@@ -41,8 +41,8 @@ from symbols import symbol_for
 from lyrics_sources import (INFO, Line, build_lines, clean_title, default_sources, find_lyrics,
                             first_artist, ordered_sources)
 
-APP_VERSION = "1.0.0"                      # stamped automatically from the git tag in CI
-GITHUB_REPO = "YOUR-USERNAME/constelyric"   # stamped automatically in CI; edit if building by hand
+APP_VERSION = "1.1.1"                      # stamped automatically from the git tag in CI
+GITHUB_REPO = "rajbhar-rohit/Constelyric"   # stamped automatically in CI; edit if building by hand
 UA = {"User-Agent": "Constelyric/1.0 (open-source lyrics app)"}
 ES_CONTINUOUS, ES_DISPLAY_REQUIRED = 0x80000000, 0x00000002
 FONT_FAMILIES = ["Segoe UI Variable Text", "Segoe UI", "Nirmala UI", "Arial"]
