@@ -36,6 +36,8 @@ from winsdk.windows.media.control import (
 )
 from winsdk.windows.storage.streams import DataReader
 
+from lyric_text import clean_word, code_segments, typed_text
+from symbols import symbol_for
 from lyrics_sources import (INFO, Line, build_lines, clean_title, default_sources, find_lyrics,
                             first_artist, ordered_sources)
 
@@ -54,7 +56,7 @@ class Settings(dict):
     PATH = _ROOT / "Constelyric" / "settings.json"
     _OLD = _ROOT / "LyricFlow" / "settings.json"          # pre-rename builds
     DEFAULTS = {"style": "Stack", "show": True, "auto": True, "awake": True, "glow": True,
-                "skip_version": "", "sources": default_sources(), "musixmatch_key": "", "lyric": "#FFFFFF", "highlight": "#FFFFFF", "secondary": "#A0A0AA"}
+                "art_bg": False, "icons": True, "clock": True, "skip_version": "", "sources": default_sources(), "musixmatch_key": "", "lyric": "#FFFFFF", "highlight": "#FFFFFF", "secondary": "#A0A0AA"}
 
     def __init__(self):
         super().__init__(copy.deepcopy(self.DEFAULTS))
@@ -176,6 +178,10 @@ def apply_awake():
 # --------------------------------------------------------------------------
 # Lyrics overlay
 # --------------------------------------------------------------------------
+FS_STYLES = ("Fisheye", "Code", "Constellation")          # the fullscreen styles
+STYLES = ["Stack", "Focus", "Fisheye", "Code", "Constellation"]
+CODE_FONTS = ["Cascadia Mono", "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", "Courier New"]
+SYMBOL_FONTS = ["Segoe UI Symbol", "Segoe UI Emoji", "Noto Sans Symbols2", "Noto Sans Symbols", "DejaVu Sans"]
 FS_STYLE = "Constellation"
 
 
@@ -187,6 +193,48 @@ def alpha(c, a):
     c = QColor(c)
     c.setAlpha(int(max(0, min(255, a))))
     return c
+
+
+def interp(table, x):
+    """Piecewise-linear lookup in [(x, y), ...]."""
+    if x <= table[0][0]:
+        return table[0][1]
+    for (x0, y0), (x1, y1) in zip(table, table[1:]):
+        if x <= x1:
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    return table[-1][1]
+
+
+# Fisheye: size / vertical offset (fraction of screen height) / opacity of a word by its slot
+# (0 = current, -1 = previous, +1 = next, as a continuous scroll position)
+FISH_SIZE = [(-2.5, 0.10), (-2, 0.20), (-1, 0.46), (0, 1.0), (1, 0.40), (2, 0.20), (2.5, 0.10)]
+FISH_Y = [(-2.5, -0.37), (-2, -0.32), (-1, -0.19), (0, 0.0), (1, 0.185), (2, 0.30), (2.5, 0.34)]
+FISH_A = [(-2.5, 0.0), (-2, 0.18), (-1, 0.88), (0, 1.0), (1, 1.0), (2, 0.0), (2.5, 0.0)]
+# Code: size / opacity of a line by its slot (0 = the line being typed, negative = older lines)
+CODE_SIZE = [(-4, 0.58), (-3, 0.64), (-2, 0.72), (-1, 0.82), (0, 1.0), (1, 1.0)]
+CODE_A = [(-4, 0.0), (-3, 0.30), (-2, 0.52), (-1, 0.76), (0, 1.0), (1, 0.15), (1.5, 0.0)]
+
+
+class Scroll:
+    """A scroll position that glides to its target (ease-out); can be sampled at any moment,
+    which is what lets the styles render real motion blur."""
+
+    def __init__(self):
+        self.a = self.b = 0.0
+        self.t0, self.dur = -10.0, 0.2
+
+    def at(self, t):
+        x = clamp01((t - self.t0) / self.dur)
+        return self.a + (self.b - self.a) * (1 - (1 - x) ** 3)
+
+    def go(self, target, t, dur, snap=False):
+        if target == self.b and not snap:
+            return
+        self.a = target if snap else self.at(t)
+        self.b, self.t0, self.dur = target, t, dur
+
+    def speed(self, t):
+        return abs(self.at(t) - self.at(t - 0.016)) / 0.016
 
 
 @dataclass
@@ -231,6 +279,12 @@ class Overlay(QWidget):
         self._next_id = 0
         self._shown_idx, self._change_t = None, -10.0   # line-change animation
         self._pulse = 0.0                               # border flash on every new word
+        self._flat_key, self._flat, self._line_first = None, [], {}      # all words in order (Fisheye)
+        self._fg_scroll, self._cd_scroll = Scroll(), Scroll()
+        self._fg_line, self._fg_appear, self._fg_old, self._fg_u = None, -10.0, None, 0.0
+        self._cd_line = None
+        self._glyph_cache = {}
+        self._bg_key, self._bg_pm = None, None          # album-art backdrop cache
         self._perim_key, self._perim_path, self._perim_len, self._stops = None, None, 1.0, []
         self._glow_img, self._bloom_pm, self._bloom_n = None, None, 0
         scr = QGuiApplication.primaryScreen()
@@ -245,7 +299,7 @@ class Overlay(QWidget):
         t.start(16)
 
     def apply_mode(self):
-        fs = S["style"] == FS_STYLE
+        fs = S["style"] in FS_STYLES
         if not S["show"]:
             self.hide()
             self._fs = None
@@ -621,6 +675,293 @@ class Overlay(QWidget):
             self.draw_word(p, nd.text, f, col, al, tx, ty, blur)
             p.restore()
 
+    # ---- Fisheye -------------------------------------------------------------
+    def draw_art_bg(self, p):
+        """Album cover filling the screen, softened and dimmed so the words stay readable."""
+        if not STATE.art:
+            return
+        w, h = self.width(), self.height()
+        key = (id(STATE.art), w, h)
+        if self._bg_key != key:
+            self._bg_key, self._bg_pm = key, None
+            src = QPixmap()
+            if src.loadFromData(STATE.art):
+                sc = src.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                Qt.TransformationMode.SmoothTransformation)
+                pm = sc.copy((sc.width() - w) // 2, (sc.height() - h) // 2, w, h)
+                pm = pm.scaled(max(2, w // 2), max(2, h // 2), Qt.AspectRatioMode.IgnoreAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation).scaled(
+                    w, h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                q = QPainter(pm)
+                q.fillRect(pm.rect(), QColor(0, 0, 0, 105))
+                vg = QRadialGradient(QPointF(w / 2, h / 2), max(w, h) * 0.75)
+                vg.setColorAt(0.45, QColor(0, 0, 0, 0))
+                vg.setColorAt(1.0, QColor(0, 0, 0, 170))
+                q.fillRect(pm.rect(), QBrush(vg))
+                q.end()
+                self._bg_pm = pm
+        if self._bg_pm:
+            p.drawPixmap(0, 0, self._bg_pm)
+
+    def _flat_words(self, lines):
+        key = (STATE.key, id(lines), len(lines))
+        if self._flat_key != key:
+            self._flat_key = key
+            self._flat = [(w, t0, t1, li) for li, l in enumerate(lines) for (w, t0, t1) in l.words]
+            self._line_first = {}
+            for i, wd in enumerate(self._flat):
+                self._line_first.setdefault(wd[3], i)
+        return self._flat
+
+    def _blur_draw(self, p, draw, t, speed):
+        """Real motion blur: draw the scene at several moments inside a short 'shutter' and average
+        them. Only runs while things are moving; still frames are drawn directly and stay crisp."""
+        if speed < 0.8:
+            draw(p, t)
+            return
+        n = 6 if speed > 4 else 4
+        shutter = min(0.06, 0.03 + 0.003 * speed)
+        w, h = self.width(), self.height()
+        sc = 0.75
+        iw, ih = int(w * sc), int(h * sc)
+        acc = QImage(iw, ih, QImage.Format.Format_ARGB32_Premultiplied)
+        acc.fill(QColor(0, 0, 0, 0))
+        layer = QImage(iw, ih, QImage.Format.Format_ARGB32_Premultiplied)
+        ap = QPainter(acc)
+        ap.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+        ap.setOpacity(1.0 / n)
+        for j in range(n):
+            layer.fill(QColor(0, 0, 0, 0))
+            lp = QPainter(layer)
+            lp.setRenderHint(QPainter.RenderHint.Antialiasing)
+            lp.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            lp.scale(sc, sc)
+            draw(lp, t - shutter * j / (n - 1))
+            lp.end()
+            ap.drawImage(0, 0, layer)
+        ap.end()
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawImage(QRectF(0, 0, w, h), acc)
+
+    def draw_clock(self, p):
+        w, h = self.width(), self.height()
+        f = QFont()
+        f.setFamilies(["Segoe UI Variable Display", "Segoe UI Light", "Segoe UI"])
+        f.setPixelSize(int(h * 0.095))
+        f.setWeight(QFont.Weight.Light)
+        p.setFont(f)
+        p.setPen(QColor(215, 215, 222, 225))
+        p.drawText(QRectF(0, h * 0.10, w, h * 0.12), Qt.AlignmentFlag.AlignCenter, time.strftime("%I:%M").lstrip("0"))
+        f2 = QFont()
+        f2.setFamilies(FONT_FAMILIES)
+        f2.setPixelSize(int(h * 0.024))
+        f2.setWeight(QFont.Weight.Bold)
+        p.setFont(f2)
+        p.setPen(QColor(230, 230, 236, 215))
+        p.drawText(QRectF(0, h * 0.062, w, h * 0.04), Qt.AlignmentFlag.AlignCenter, time.strftime("%a %b %d"))
+
+    # ---- Fisheye -------------------------------------------------------------
+    def draw_fisheye(self, p, hi, t, now):
+        """Previous word small & italic on top, the current word big in the middle, the next word as a
+        small orange box below. Words glide up a slot at a time (the next word's box fills in as it
+        reaches the middle), with motion blur and a stretch while moving. A new line starts with its
+        first word waiting in the middle as an orange block."""
+        words = self._flat_words(STATE.lines)
+        if S["clock"]:
+            self.draw_clock(p)
+        n = len(words)
+        if not n:
+            return
+        idx = -1
+        for i, wd in enumerate(words):
+            if wd[1] > now:
+                break
+            idx = i
+        pending, nxt = None, idx + 1
+        if nxt < n and (idx < 0 or words[nxt][3] != words[idx][3]):
+            if now >= words[nxt][1] - 0.7 and (idx < 0 or now > words[idx][2]):
+                pending = nxt                                    # first word of a line, waiting
+        if idx < 0 and pending is None:
+            return
+        target = pending if pending is not None else idx
+        group = words[target][3]
+        if group != self._fg_line:                               # a new line: old words drop away
+            if self._fg_line is not None:
+                self._fg_old = (self._fg_line, self._fg_u, t)
+            self._fg_line, self._fg_appear = group, t
+            self._fg_scroll.go(float(target), t, 0.2, snap=True)
+        else:
+            dur = min(0.22, max(0.09, 0.6 * (words[target][2] - words[target][1])))
+            self._fg_scroll.go(float(target), t, dur, snap=abs(target - self._fg_scroll.at(t)) > 3.5)
+        self._fg_u = self._fg_scroll.at(t)
+        enter = clamp01((t - self._fg_appear) / 0.18)
+        speed = self._fg_scroll.speed(t)
+        sp = clamp01(speed / 9.0)
+        self._blur_draw(p, lambda lp, tt: self._fish_items(lp, group, self._fg_scroll.at(tt), now, 1.0, sp, enter, hi),
+                        t, speed)
+        if self._fg_old and t - self._fg_old[2] < 0.14:
+            og, ou, ot = self._fg_old
+            self._fish_items(p, og, ou, now, 1 - (t - ot) / 0.14, 0.0, 1.0, hi)
+
+    def _fish_items(self, lp, group, u, now, am, sp, enter, hi):
+        words = self._flat
+        lo, hi_i = max(0, int(u) - 3), min(len(words), int(u) + 4)
+        for i in range(lo, hi_i):                                # past words first, next word on top
+            if words[i][3] == group and abs(i - u) <= 2.5:
+                self._fish_item(lp, i, i - u, now, am, sp, enter, hi)
+
+    def _glyph_pm(self, glyph, px, rgb):
+        """The icon as a silhouette filled with the theme colour (colour-emoji fonts would otherwise
+        ignore it). Drawn at 2x and cached."""
+        key = (glyph, px, rgb)
+        pm = self._glyph_cache.get(key)
+        if pm is None:
+            f = QFont()
+            f.setFamilies(SYMBOL_FONTS)
+            f.setPixelSize(px * 2)
+            fm = QFontMetrics(f)
+            pm = QPixmap(fm.horizontalAdvance(glyph) + 4, fm.height() + 4)
+            pm.fill(QColor(0, 0, 0, 0))
+            q = QPainter(pm)
+            q.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            q.setFont(f)
+            q.setPen(QColor(255, 255, 255))
+            q.drawText(2, 2 + fm.ascent(), glyph)
+            q.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            q.fillRect(pm.rect(), QColor(*rgb))
+            q.end()
+            if len(self._glyph_cache) > 64:
+                self._glyph_cache.clear()
+            self._glyph_cache[key] = pm
+        return pm
+
+    def _fish_item(self, lp, i, pos, now, am, sp, enter, hi):
+        text, t0, t1, li = self._flat[i]
+        w, h = self.width(), self.height()
+        f, a = interp(FISH_SIZE, pos), interp(FISH_A, pos) * am
+        if f <= 0.02 or a <= 0.01:
+            return
+        box = clamp01(pos)                                       # waiting words are orange boxes...
+        sx, sy = 1 + 0.28 * sp, 1 - 0.14 * sp                    # ...stretched wide while moving
+        if i == self._line_first.get(li):
+            box = 1.0 if now < t0 else max(box, 1 - clamp01((now - t0) / 0.14))
+            e = (1 - enter) ** 2
+            a *= enter
+            sx *= 1 + 0.45 * e
+            sy *= 1 - 0.30 * e
+        ital = clamp01(abs(pos))
+        big = int(h * 0.19)
+        font = QFont()
+        font.setFamilies(FONT_FAMILIES)
+        font.setPixelSize(big)
+        font.setWeight(QFont.Weight.Bold)
+        fm = QFontMetrics(font)
+        tw = fm.horizontalAdvance(text)
+        glyph = symbol_for(text) if S["icons"] else None
+        gpm = self._glyph_pm(glyph, int(big * 0.78), (hi.red(), hi.green(), hi.blue())) if glyph else None
+        gw = gpm.width() / 2 if gpm else 0
+        gap = big * 0.16 if glyph else 0
+        total = tw + gw + gap
+        fit = min(1.0, w * 0.80 / max(total, 1))
+        left = glyph in ("♥", "♡")
+        xg = -total / 2 if left else -total / 2 + tw + gap
+        xt = -total / 2 + gw + gap if left else -total / 2
+        base = fm.ascent() * 0.36
+        cream, dark = self.mix(hi, QColor(255, 255, 255), 0.55), QColor(48, 26, 6)
+        lp.save()
+        lp.translate(w / 2, h * 0.54 + interp(FISH_Y, pos) * h)
+        lp.scale(f * fit * sx, f * fit * sy)
+        lp.shear(-0.2 * ital, 0)
+        if box > 0.01:
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(xt - big * 0.12, base - fm.ascent() * 0.86, tw + big * 0.24,
+                                       fm.ascent() * 1.02), big * 0.07, big * 0.07)
+            lp.setPen(Qt.PenStyle.NoPen)
+            lp.setBrush(alpha(hi, 255 * box * a))
+            lp.drawPath(path)
+        lp.setFont(font)
+        lp.setPen(alpha(self.mix(cream, dark, box), 255 * a))
+        lp.drawText(QPointF(xt, base), text)
+        if gpm:                                                  # icon: a solid shape in the theme colour
+            lp.setOpacity(lp.opacity() * clamp01(a))
+            lp.drawPixmap(QRectF(xg - 1, base - gpm.height() / 2 * 0.78, gpm.width() / 2, gpm.height() / 2), gpm,
+                          QRectF(gpm.rect()))
+        lp.restore()
+
+    # ---- Code ----------------------------------------------------------------
+    def draw_code(self, p, hi, t, now):
+        """Lyrics typed like code with a red block cursor. When the next line starts, the finished line
+        becomes dotted.words, a // comment or a call(...); and everything scrolls up with motion blur."""
+        lines = STATE.lines
+        if not lines:
+            return
+        idx = -1
+        for i, l in enumerate(lines):
+            if l.start <= now:
+                idx = i
+        if idx < 0 or not lines[idx].words:
+            return
+        if idx != self._cd_line:
+            self._cd_scroll.go(float(idx), t, 0.20, snap=(self._cd_line is None or abs(idx - self._cd_scroll.at(t)) > 2.5))
+            self._cd_line = idx
+        self._blur_draw(p, lambda lp, tt: self._code_stack(lp, tt, now, hi, idx), t, self._cd_scroll.speed(t))
+
+    def _code_stack(self, lp, tt, now, hi, idx):
+        lines, (w, h) = STATE.lines, (self.width(), self.height())
+        u = self._cd_scroll.at(tt)
+        font = QFont()
+        font.setFamilies(CODE_FONTS)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setPixelSize(int(h * 0.072))
+        font.setWeight(QFont.Weight.Bold)
+        fm = QFontMetrics(font)
+        adv = fm.horizontalAdvance
+        white, black = QColor(255, 255, 255), QColor(0, 0, 0)
+        accent, dim, coral = self.mix(hi, white, 0.35), self.mix(hi, black, 0.30), QColor(255, 92, 102)
+        cols = {"word": hi, "pron": coral, "dot": dim, "comment": dim, "name": self.mix(hi, white, 0.15),
+                "arg": accent, "punct": dim}
+        base_y = fm.ascent() * 0.35
+        for j in range(max(0, idx - 4), idx + 1):
+            words = [(clean_word(x), t0, t1) for x, t0, t1 in lines[j].words if clean_word(x)]
+            if not words:
+                continue
+            pos = j - u
+            f, a = interp(CODE_SIZE, pos), interp(CODE_A, pos)
+            if a < 0.02:
+                continue
+            seg, kind = code_segments(words)
+            full = " ".join(x for x, _, _ in words)
+            prefix = "// " if kind == "comment" else ""
+            fit = min(1.0, w * 0.88 / max(adv(prefix + full), sum(adv(s) for s, _ in seg), 1))
+            lp.save()
+            lp.translate(w / 2, h * 0.60 + pos * h * 0.118)
+            lp.scale(f * fit, f * fit)
+            lp.setFont(font)
+            if j == idx:                                         # the line being typed
+                typed = typed_text(words, now)
+                x0 = -adv(prefix + full) / 2
+                if prefix and len(typed) >= 2:
+                    lp.setPen(alpha(dim, 255 * a))
+                    lp.drawText(QPointF(x0, base_y), prefix)
+                lp.setPen(alpha(accent, 255 * a))
+                lp.drawText(QPointF(x0 + adv(prefix), base_y), typed)
+                if typed != full or int(now * 2) % 2 == 0:       # solid while typing, blinks when idle
+                    cx = x0 + adv(prefix + typed)
+                    lp.setPen(Qt.PenStyle.NoPen)
+                    lp.setBrush(alpha(coral, 240 * a))
+                    lp.drawRect(QRectF(cx + 1, base_y - fm.ascent() * 0.93, adv("M") * 0.62, fm.ascent() * 1.05))
+            else:                                                # finished line
+                prog = clamp01(u - j) if j == idx - 1 else 1.0   # cross-fade from the typed form
+                if prog < 1:
+                    lp.setPen(alpha(accent, 255 * a * (1 - prog)))
+                    lp.drawText(QPointF(-adv(prefix + full) / 2, base_y), prefix + full)
+                x = -sum(adv(s) for s, _ in seg) / 2
+                for text, role in seg:
+                    lp.setPen(alpha(cols[role], 255 * a * prog))
+                    lp.drawText(QPointF(x, base_y), text)
+                    x += adv(text)
+            lp.restore()
+
     # ---- Stack / Focus styles -------------------------------------------------
     def draw_line(self, p, line, y, now, scale, amul, state, k=1.0, rise=False):
         """state: active (karaoke wipe + lift) | past | future.  amul: overall opacity."""
@@ -701,13 +1042,20 @@ class Overlay(QWidget):
         lines, now = STATE.lines, STATE.now()
         style = S["style"]
 
-        if style == FS_STYLE:
+        if style in FS_STYLES:
             p.fillRect(self.rect(), QColor(0, 0, 0))
             hi = self.hi_color()
+            if style == "Fisheye" and S["art_bg"]:
+                self.draw_art_bg(p)
             if S["glow"]:
                 self.draw_border(p, hi, now_t)
-            self.update_nodes(lines, now)
-            self.draw_constellation(p, hi, now_t, now)
+            if style == "Constellation":
+                self.update_nodes(lines, now)
+                self.draw_constellation(p, hi, now_t, now)
+            elif style == "Fisheye":
+                self.draw_fisheye(p, hi, now_t, now)
+            else:
+                self.draw_code(p, hi, now_t, now)
             return
 
         if not lines or not STATE.playing:
@@ -756,7 +1104,7 @@ class Overlay(QWidget):
                                rise=True)
 
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape and S["style"] == FS_STYLE:
+        if e.key() == Qt.Key.Key_Escape and S["style"] in FS_STYLES:
             S["style"] = "Stack"
             S.save()
             self.apply_mode()
@@ -804,40 +1152,48 @@ class Switch(QWidget):
 
 
 class Segmented(QWidget):
+    """Pill selector; wraps into rows of `cols`."""
     changed = pyqtSignal(str)
 
-    def __init__(self, options, current):
+    def __init__(self, options, current, cols=None):
         super().__init__()
         self.options, self.current = options, current
-        self.setFixedHeight(32)
+        self.cols = cols or len(options)
+        self.rows = -(-len(options) // self.cols)
+        self.setFixedHeight(32 * self.rows + 4 * (self.rows - 1))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set(self, v):
         self.current = v
         self.update()
 
+    def _cell(self, i):
+        r, c = divmod(i, self.cols)
+        in_row = min(self.cols, len(self.options) - r * self.cols)      # last row stretches to fill
+        cw = self.width() / in_row
+        return QRectF(c * cw, r * 36, cw, 32)
+
     def mousePressEvent(self, e):
-        i = min(len(self.options) - 1, int(e.position().x() / (self.width() / len(self.options))))
-        if self.options[i] != self.current:
-            self.current = self.options[i]
-            self.update()
-            self.changed.emit(self.current)
+        for i, name in enumerate(self.options):
+            if self._cell(i).contains(e.position()) and name != self.current:
+                self.current = name
+                self.update()
+                self.changed.emit(name)
+                return
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(255, 255, 255, 18))
-        p.drawRoundedRect(QRectF(self.rect()), 9, 9)
-        w = self.width() / len(self.options)
-        i = self.options.index(self.current)
-        p.setBrush(QColor(255, 255, 255, 52))
-        p.drawRoundedRect(QRectF(i * w + 2, 2, w - 4, self.height() - 4), 7, 7)
         f = QFont(); f.setFamilies(FONT_FAMILIES); f.setPixelSize(13)
         p.setFont(f)
-        for k, name in enumerate(self.options):
-            p.setPen(QColor(255, 255, 255, 255 if name == self.current else 150))
-            p.drawText(QRectF(k * w, 0, w, self.height()), Qt.AlignmentFlag.AlignCenter, name)
+        for i, name in enumerate(self.options):
+            cell = self._cell(i)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 52 if name == self.current else 18))
+            p.drawRoundedRect(cell.adjusted(1, 1, -1, -1), 8, 8)
+            p.setPen(QColor(255, 255, 255, 255 if name == self.current else 160))
+            p.drawText(cell, Qt.AlignmentFlag.AlignCenter, name)
 
 
 class ColorWell(QWidget):
@@ -999,13 +1355,18 @@ class Panel(QWidget):
 
         # Display
         v.addWidget(self._section("DISPLAY"))
-        self.seg = Segmented(["Stack", "Focus", "Constellation"], S["style"])
+        self.seg = Segmented(STYLES, S["style"], cols=3)
         self.seg.changed.connect(self._style)
         v.addWidget(self.seg)
 
         # Toggles
         v.addWidget(self._section("OPTIONS"))
         self.sw_show, self.sw_auto, self.sw_awake = Switch(S["show"]), Switch(S["auto"]), Switch(S["awake"])
+        self.sw_clock = Switch(S["clock"])
+        self.sw_clock.toggled.connect(lambda b: self._set("clock", b))
+        self.sw_art, self.sw_icons = Switch(S["art_bg"]), Switch(S["icons"])
+        self.sw_art.toggled.connect(lambda b: self._set("art_bg", b))
+        self.sw_icons.toggled.connect(lambda b: self._set("icons", b))
         self.sw_glow = Switch(S["glow"])
         self.sw_glow.toggled.connect(lambda b: self._set("glow", b))
         self.src_btn = QPushButton("Choose…"); self.src_btn.setObjectName("link")
@@ -1017,19 +1378,33 @@ class Panel(QWidget):
         self.sw_awake.toggled.connect(lambda b: (self._set("awake", b), apply_awake()))
         v.addWidget(self._group([("Show lyrics", self.sw_show),
                                  ("Auto Sync colours", self.sw_auto),
-                                 ("Keep display awake", self.sw_awake),
-                                 ("Border glow", self.sw_glow),
-                                 ("Lyrics sources", self.src_btn)]))
+                                 ("Border glow", self.sw_glow)]))
 
-        # Colours
-        v.addWidget(self._section("COLOURS"))
+        self.more_btn = QPushButton("More options  ▾"); self.more_btn.setObjectName("link")
+        self.more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.more_btn.clicked.connect(self._toggle_more)
+        v.addWidget(self.more_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        # less-used options + colours live in a section that starts folded so the panel stays short
+        self.more = QWidget()
+        mv = QVBoxLayout(self.more)
+        mv.setContentsMargins(0, 0, 0, 0)
+        mv.setSpacing(10)
+        mv.addWidget(self._group([("Keep display awake", self.sw_awake),
+                                  ("Album art backdrop", self.sw_art),
+                                  ("Word icons", self.sw_icons),
+                                  ("Lock-screen clock", self.sw_clock),
+                                  ("Lyrics sources", self.src_btn)]))
+        mv.addWidget(self._section("COLOURS"))
         self.wells = {k: ColorWell(S[k]) for k in ("lyric", "highlight", "secondary")}
         for k, w in self.wells.items():
             w.clicked.connect(lambda k=k: self._pick(k))
         self.wells["highlight"].set_active(not S["auto"])
-        v.addWidget(self._group([("Lyric", self.wells["lyric"]),
-                                 ("Highlight", self.wells["highlight"]),
-                                 ("Secondary text", self.wells["secondary"])]))
+        mv.addWidget(self._group([("Lyric", self.wells["lyric"]),
+                                  ("Highlight", self.wells["highlight"]),
+                                  ("Secondary text", self.wells["secondary"])]))
+        self.more.setVisible(False)
+        v.addWidget(self.more)
 
         ver = QHBoxLayout()
         self.up_label = QLabel(f"Version {APP_VERSION}"); self.up_label.setObjectName("sub")
@@ -1040,7 +1415,7 @@ class Panel(QWidget):
         v.addLayout(ver)
 
         hint = QLabel("Windows can't draw over the lock screen, so lyrics show on your desktop.\n"
-                      "Constellation is fullscreen: press Esc to exit.")
+                      "Fisheye, Code and Constellation are fullscreen: press Esc to exit.")
         hint.setObjectName("sub"); hint.setWordWrap(True)
         v.addWidget(hint)
 
@@ -1093,6 +1468,14 @@ class Panel(QWidget):
             S.save()
             self.wells[key].set_color(c)
         self.activateWindow()
+
+    def _toggle_more(self):
+        show = not self.more.isVisible()
+        self.more.setVisible(show)
+        self.more_btn.setText("Fewer options  ▴" if show else "More options  ▾")
+        self.adjustSize()
+        geo = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(geo.right() - self.width() + 1, geo.bottom() - self.height() + 1)   # stay anchored bottom-right
 
     def _open_sources(self):
         self.hide()

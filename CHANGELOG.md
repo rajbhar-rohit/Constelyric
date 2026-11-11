@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **New style: Fisheye** - one word at a time (previous small and italic, current big, next as an orange box), words
+  glide a slot at a time with motion blur and a stretch, the first word of a new line waits as an orange block, small
+  icons beside matching words, and an optional lock-screen clock. Optional album-art backdrop.
+- **New style: Code** - lyrics typed like code with a red block cursor; finished lines become `dotted.words`,
+  `// comments` or `call(args);` and scroll up with motion blur.
+- The panel folds its less-used options and colours under *More options* so it stays short.
+
 - **More lyrics sources:** lrc.red, BiniLyrics, LyricsPlus, KuGou (word-by-word KRC), BetterLyrics and Musixmatch
   (your own API key) join LRCLIB. A new *Lyrics sources* window lets you switch them on/off and reorder them; the
   panel shows which service was used. Word-by-word results are preferred over line-by-line ones.

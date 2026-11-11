@@ -9,15 +9,16 @@
 
 Constelyric shows the lyrics of whatever is playing (Spotify, Apple Music, YouTube in a browser, VLC...) with each word lighting up as it is sung.
 
-**Three styles**
+**Five styles**
 - **Stack** - three lines that glide up as the song moves on, with a karaoke wipe across each word.
 - **Focus** - one line at a time; upcoming words float up into place.
-- **Constellation** - fullscreen: every word becomes a star, linked into a growing constellation, inside a soft ambient glow that drifts around the screen edge.
-
-## Website
-
-The download page lives in `docs/index.html`. Edit the `REPO` line near the bottom to your `username/repo`, then enable
-**Settings -> Pages -> Deploy from a branch -> `main` / `/docs`** on GitHub. The Download button then always links to your latest release.
+- **Fisheye** - fullscreen, one word at a time: the previous word small and italic above, the current word big in
+  the middle, the next word as a small orange box below. Words glide up a slot at a time, the box fills in as the word
+  reaches the middle, and fast moves stretch and motion-blur. A new line starts with its first word waiting as an orange
+  block. Small icons (a heart, an arrow, a person...) appear beside matching words, and a lock-screen style clock sits on top.
+- **Code** - fullscreen, lyrics typed out like code in a monospace font with a red block cursor. When the next line starts,
+  the finished line becomes `dotted.words`, a `// comment` or a `call(args);` and everything scrolls up with motion blur.
+- **Constellation** - fullscreen: every word becomes a star, linked into a growing constellation, inside a soft ambient glow.
 
 ## Install
 
@@ -33,8 +34,9 @@ To uninstall: Windows Settings -> Apps -> Constelyric (or delete the portable fo
 ## Using it
 
 - **Tray icon:** click to open the panel, right-click to quit.
-- **Display:** Stack, Focus or Constellation (fullscreen - press **Esc** to leave).
-- **Options:** show/hide lyrics, colours from the album art, keep the display awake, border glow, check for updates.
+- **Display:** Stack, Focus, Fisheye, Code or Constellation (the last three are fullscreen - press **Esc** to leave).
+- **Options:** show/hide lyrics, colours from the album art, border glow; under *More options*: keep the display awake,
+  album-art backdrop (Fisheye), word icons, lock-screen clock, lyrics sources and colours. Check for updates is in the panel too.
 - Windows doesn't let apps draw over the lock screen, so lyrics appear on the desktop.
 
 ## Updates
@@ -43,6 +45,16 @@ Constelyric checks GitHub Releases shortly after launch and every 6 hours. When 
 **Download**, **Later** or **Skip version**. You can also click **Check for updates** in the panel or tray menu.
 Release builds stamp their own version and repo automatically (`tools/set_version.py`); if you build by hand, set
 `GITHUB_REPO` near the top of `constelyric.py`.
+
+## Word icons (Fisheye)
+
+About 30 ideas and 900 words across English, Hindi/Urdu/Punjabi (romanised and Devanagari), Spanish, French, Portuguese,
+German, Italian, Turkish, Russian, Arabic, Korean, Japanese and Chinese get a small icon. Add your own in `symbols.py`
+(and send a pull request!) or without touching code in `%APPDATA%\Constelyric\icons.json`:
+
+```json
+{ "tumhare": "👤", "samundar": "≈" }
+```
 
 ## Lyrics sources
 
